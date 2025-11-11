@@ -1,51 +1,78 @@
-import os
 from fastapi import FastAPI, HTTPException
+import os
 import tushare as ts
+import traceback  # 导入traceback库，用于格式化错误信息
 
-# --- 关键部分：检查环境变量 ---
-# 从 Vercel 的环境变量中获取 Token
-# 如果在本地测试，可以创建一个 .env 文件并写入 TUSHARE_TOKEN='你的token'
-token = os.getenv('TUSHARE_TOKEN')
+# 创建一个空的 app 变量，我们稍后会填充它
+app = None
 
-# 如果没有找到token，应用将无法启动，并给出明确提示
-if not token:
-    # 使用 HTTPException 在 FastAPI 启动时更容易调试
-    # 但在 Vercel 环境下，更简单的方式是直接 raise 一个错误
-    raise ValueError("错误：环境变量 TUSHARE_TOKEN 未设置或为空。请在 Vercel 项目设置中添加它。")
+# --- 关键的调试代码块 ---
+try:
+    # 尝试执行所有可能在启动时失败的代码
+    print("--- Starting Application Initialization ---")
 
-# 初始化 Tushare
-ts.set_token(token)
-pro = ts.pro_api()
+    # 1. 检查环境变量
+    token = os.environ.get('TUSHARE_TOKEN')
+    if not token:
+        # 如果没有token，我们主动抛出一个清晰的错误
+        raise ValueError("CRITICAL: TUSHARE_TOKEN environment variable is not set or empty in Vercel project settings!")
+    
+    print(f"Successfully loaded TUSHARE_TOKEN starting with: {token[:4]}...")
 
-# --- FastAPI 应用实例 ---
-# Vercel 会自动寻找一个名为 "app" 的 FastAPI 实例
-app = FastAPI()
+    # 2. 尝试初始化 tushare
+    ts.set_token(token)
+    pro = ts.pro_api()
+    print("Tushare pro_api initialized successfully.")
 
-# --- 根路由 (/) ---
-# Vercel 的文件结构决定了 'api/index.py' 会处理 '/api' 路径下的请求
-# 我们在这里定义一个 '/api' 根路径的响应，方便测试
-@app.get("/api")
-def read_root():
-    return {"message": "欢迎使用股票查询工具 API！部署成功！"}
+    # 3. 如果一切顺利，创建真正的FastAPI应用
+    app = FastAPI(title="My Stock Tool API")
+    print("FastAPI app created successfully.")
 
-# --- 定义我们的工具路由 ---
-# 注意：这里的路径是相对 '/api' 的，所以是 /query-stock
-# 最终访问的 URL 是 https://your-app-name.vercel.app/api/query-stock
-@app.get("/api/query-stock")
-def query_stock(ts_code: str):
-    """
-    查询单个股票的日线行情数据。
-    :param ts_code: 股票代码, 例如 '000001.SZ'
-    :return: JSON格式的日线行情数据
-    """
-    try:
-        df = pro.daily(ts_code=ts_code, limit=1)
-        if df.empty:
-            raise HTTPException(status_code=404, detail="未查询到该股票代码的数据")
-        # 将DataFrame转换为JSON格式
-        return df.to_dict(orient='records')
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"查询时发生内部错误: {str(e)}")
+    @app.get("/api/health-check")
+    def health_check():
+        """
+        一个简单的健康检查端点，确认应用是否正常运行。
+        """
+        return {"status": "ok", "message": "Application is running and Tushare is initialized."}
 
-# FastAPI 会自动根据上面的代码生成 OpenAPI 文档
-# 默认路径是 /openapi.json，Vercel 会将其映射到 /api/openapi.json
+    @app.get("/api/test-data")
+    def get_test_data():
+        """
+        尝试从Tushare获取少量数据，以验证连接。
+        """
+        data = pro.trade_cal(exchange='SSE', start_date='20240101', end_date='20240105')
+        return {"status": "success", "data": data.to_dict(orient='records')}
+
+    print("--- Application Initialization Finished ---")
+
+
+except Exception as e:
+    # --- 如果上面 try 块中的任何一步失败，都会进入这里 ---
+    print("---!!! FATAL ERROR DURING STARTUP !!!---")
+    
+    # 格式化完整的错误堆栈信息
+    error_details = traceback.format_exc()
+    
+    # 在Vercel日志中打印这个详细错误
+    print(error_details)
+    
+    print("--- Creating a fallback error reporting app ---")
+    
+    # 创建一个备用的、仅用于报告错误的 FastAPI 应用
+    app = FastAPI()
+
+    @app.get("/api/{full_path:path}")
+    def report_startup_error(full_path: str):
+        """
+        捕获所有请求，并返回启动失败的详细错误信息。
+        """
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Application failed to start. See traceback below.",
+                "error_type": str(type(e).__name__),
+                "error_message": str(e),
+                "traceback": error_details.splitlines() # 将堆栈拆分成列表，更易读
+            }
+        )
+
