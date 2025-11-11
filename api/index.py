@@ -1,99 +1,51 @@
 import os
-import tushare as ts
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-import json
+import tushare as ts
 
-# --- 配置区域 ---
-# FastAPI应用实例
-app = FastAPI(
-    title="Dify Tushare Tool API",
-    description="一个为Dify定制的、用于查询Tushare股票数据的增强版API工具。它会自动为股票代码添加.SH或.SZ后缀。",
-    version="1.1",
-)
+# --- 关键部分：检查环境变量 ---
+# 从 Vercel 的环境变量中获取 Token
+# 如果在本地测试，可以创建一个 .env 文件并写入 TUSHARE_TOKEN='你的token'
+token = os.getenv('TUSHARE_TOKEN')
 
-# Tushare pro token
-TUSHARE_TOKEN = os.getenv("TUSHARE_TOKEN", "YOUR_DEFAULT_TOKEN_IF_ANY")
-ts.set_token(TUSHARE_TOKEN)
+# 如果没有找到token，应用将无法启动，并给出明确提示
+if not token:
+    # 使用 HTTPException 在 FastAPI 启动时更容易调试
+    # 但在 Vercel 环境下，更简单的方式是直接 raise 一个错误
+    raise ValueError("错误：环境变量 TUSHARE_TOKEN 未设置或为空。请在 Vercel 项目设置中添加它。")
+
+# 初始化 Tushare
+ts.set_token(token)
 pro = ts.pro_api()
 
-# --- 数据模型定义 ---
-class StockRequest(BaseModel):
-    ticker: str = Field(..., description="要查询的6位A股股票代码（例如 '000001' 或 '600519'）")
+# --- FastAPI 应用实例 ---
+# Vercel 会自动寻找一个名为 "app" 的 FastAPI 实例
+app = FastAPI()
 
-# --- 辅助函数 ---
-def get_suffix(stock_code):
-    """根据股票代码首位判断并返回对应的交易所后缀"""
-    if stock_code.startswith('6'):
-        return '.SH'
-    elif stock_code.startswith('0') or stock_code.startswith('3'):
-        return '.SZ'
-    else:
-        return None # 或者可以返回一个默认值或抛出异常
+# --- 根路由 (/) ---
+# Vercel 的文件结构决定了 'api/index.py' 会处理 '/api' 路径下的请求
+# 我们在这里定义一个 '/api' 根路径的响应，方便测试
+@app.get("/api")
+def read_root():
+    return {"message": "欢迎使用股票查询工具 API！部署成功！"}
 
-# --- API端点 ---
-@app.post("/api/get_stock_realtime_data", summary="获取股票实时行情和基础信息")
-def get_stock_data(request: StockRequest):
+# --- 定义我们的工具路由 ---
+# 注意：这里的路径是相对 '/api' 的，所以是 /query-stock
+# 最终访问的 URL 是 https://your-app-name.vercel.app/api/query-stock
+@app.get("/api/query-stock")
+def query_stock(ts_code: str):
     """
-    根据提供的6位股票代码，查询该股票的实时行情、市值、市盈率等基本信息。
-    API会自动判断并添加 '.SH' (上海) 或 '.SZ' (深圳) 后缀。
+    查询单个股票的日线行情数据。
+    :param ts_code: 股票代码, 例如 '000001.SZ'
+    :return: JSON格式的日线行情数据
     """
-    stock_code = request.ticker.strip()
-    
-    if not TUSHARE_TOKEN or TUSHARE_TOKEN == "YOUR_DEFAULT_TOKEN_IF_ANY":
-        raise HTTPException(status_code=500, detail="服务器未配置TUSHARE_TOKEN环境变量")
-
-    if len(stock_code) != 6 or not stock_code.isdigit():
-        raise HTTPException(status_code=400, detail="请输入有效的6位数字股票代码。")
-
-    suffix = get_suffix(stock_code)
-    if not suffix:
-        raise HTTPException(status_code=400, detail=f"无法识别的股票代码前缀: {stock_code}")
-
-    ts_code = stock_code + suffix
-
     try:
-        # 尝试获取数据
-        df_basic = pro.daily_basic(ts_code=ts_code, fields='ts_code,trade_date,close,turnover_rate,volume_ratio,pe,total_mv')
-        df_quote = pro.realtime_quote(ts_code=ts_code)
-
-        if df_basic.empty and df_quote.empty:
-            raise HTTPException(status_code=404, detail=f"未能查询到股票代码 {ts_code} 的任何数据，请检查代码是否正确或已上市。")
-
-        # 合并结果
-        result = {}
-        if not df_basic.empty:
-            latest_basic = df_basic.iloc[0].to_dict()
-            result.update({
-                "交易日期": latest_basic.get('trade_date'),
-                "收盘价": latest_basic.get('close'),
-                "换手率(%)": latest_basic.get('turnover_rate'),
-                "量比": latest_basic.get('volume_ratio'),
-                "市盈率(PE)": latest_basic.get('pe'),
-                "总市值(万元)": latest_basic.get('total_mv'),
-            })
-        
-        if not df_quote.empty:
-            quote = df_quote.iloc[0].to_dict()
-            result.update({
-                "股票名称": quote.get('name'),
-                "当前价": quote.get('price'),
-                "开盘价": quote.get('open'),
-                "最高价": quote.get('high'),
-                "最低价": quote.get('low'),
-                "昨日收盘价": quote.get('pre_close'),
-                "成交量(手)": quote.get('volume'),
-                "成交额(元)": quote.get('amount'),
-            })
-        
-        # 使用json.dumps确保所有数据类型都可序列化，并转回dict
-        return json.loads(json.dumps(result, allow_nan=False))
-
+        df = pro.daily(ts_code=ts_code, limit=1)
+        if df.empty:
+            raise HTTPException(status_code=404, detail="未查询到该股票代码的数据")
+        # 将DataFrame转换为JSON格式
+        return df.to_dict(orient='records')
     except Exception as e:
-        # 捕获Tushare本身可能抛出的异常或其他网络错误
-        raise HTTPException(status_code=500, detail=f"查询过程中发生内部错误: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"查询时发生内部错误: {str(e)}")
 
-# OpenAPI schema 端点，供Dify导入
-@app.get("/api/openapi.json", summary="获取OpenAPI Schema")
-def get_openapi_schema():
-    return app.openapi()
+# FastAPI 会自动根据上面的代码生成 OpenAPI 文档
+# 默认路径是 /openapi.json，Vercel 会将其映射到 /api/openapi.json
